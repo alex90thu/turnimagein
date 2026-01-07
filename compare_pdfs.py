@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""比较两个 PDF 是否存在两页包含相同插图（使用本地 Ollama qwen3-vl:235b 进行可选验证）。
-
-用法示例:
-python compare_pdfs.py a.pdf b.pdf --verify
-
-依赖：pymupdf、Pillow、imagehash、requests
+"""
+优化版 PDF 配图查重 (Embedding + LLM)
+功能：
+1. 本地使用 CLIP 模型对所有页面图片进行 Embedding。
+2. 计算向量相似度，快速召回（粗筛）可疑页面对。
+3. 仅对高可疑对调用 Ollama 视觉大模型进行精排（验证）。
+4. 结果存入 output/，日志存入 log/。
 """
 import argparse
 import base64
@@ -12,73 +13,91 @@ import csv
 import datetime
 import io
 import json
+import logging
 import os
-import re
 import sys
-from typing import List, Dict, Optional, Tuple
+import torch
+from typing import List, Dict
 
-import fitz
+import fitz  # PyMuPDF
 from PIL import Image
 import requests
-import imagehash
+from sentence_transformers import SentenceTransformer, util
 
+# --- 配置区域 ---
+# Ollama 设置
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-OLLAMA_MODEL = "qwen3-vl:235b"
+OLLAMA_MODEL = "qwen3-vl:235b"  # 请确保你的显存能跑动这个模型，跑不动请换 qwen2.5-vl:7b
 
+# 本地 Embedding 模型 (首次运行会自动下载 ~300MB)
+EMBEDDING_MODEL_NAME = "./clip-ViT-B-32"
 
-def render_pdf_pages(pdf_path: str, zoom: float = 2.0, compute_hash: bool = False) -> List[Dict]:
-    doc = fitz.open(pdf_path)
+# 路径设置 (支持相对路径或绝对路径)
+BASE_OUTPUT_DIR = "output"
+BASE_LOG_DIR = os.path.join(BASE_OUTPUT_DIR, "log")
+# ----------------
+
+# 初始化日志配置
+def setup_logging():
+    # 确保目录存在
+    if not os.path.exists(BASE_LOG_DIR):
+        os.makedirs(BASE_LOG_DIR)
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    log_filename = os.path.join(BASE_LOG_DIR, f"run_{timestamp}.log")
+    
+    # 配置 Logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # 文件处理器 (写入 log/)
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    # 控制台处理器 (输出到屏幕)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter('%(message)s')) # 控制台只看简要信息
+    logger.addHandler(console_handler)
+    
+    return logger, timestamp
+
+logger = logging.getLogger() # 全局 logger 占位
+
+def render_pdf_pages(pdf_path: str, zoom: float = 1.0) -> List[Dict]:
+    """渲染 PDF 页面为图像"""
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        logger.error(f"无法打开 PDF: {pdf_path}, 错误: {e}")
+        sys.exit(1)
+        
     pages = []
     mat = fitz.Matrix(zoom, zoom)
+    logger.info(f"正在解析 PDF: {pdf_path} (共 {len(doc)} 页)...")
+    
     for i in range(len(doc)):
-        page = doc[i]
-        has_image = len(page.get_images(full=True)) > 0
-        if not has_image:
-            pages.append(
-                {
-                    "page_index": i + 1,
-                    "image": None,
-                    "hash": None,
-                    "b64": None,
-                    "raw": None,
-                    "has_image": False,
-                }
-            )
-            continue
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes(output="png")
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-        ph = imagehash.phash(img) if compute_hash else None
-        pages.append(
-            {
+        try:
+            page = doc[i]
+            # 渲染页面
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes(output="png")
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            
+            pages.append({
                 "page_index": i + 1,
-                "image": img,
-                "hash": ph,
-                "b64": b64,
-                "raw": img_bytes,
-                "has_image": True,
-            }
-        )
+                "image": img,  # 用于 CLIP
+                "b64": b64,    # 用于 Ollama
+                "source": pdf_path
+            })
+        except Exception as e:
+            logger.warning(f"页面 {i+1} 解析失败，跳过: {e}")
+            
     return pages
 
-
-def find_candidate_pairs(
-    pages1: List[Dict], pages2: List[Dict], max_hamming: int = 0
-) -> List[Tuple[Dict, Dict, Optional[int]]]:
-    pairs: List[Tuple[Dict, Dict, Optional[int]]] = []
-    for p1 in pages1:
-        for p2 in pages2:
-            if p1["hash"] is None or p2["hash"] is None:
-                pairs.append((p1, p2, None))
-                continue
-            dist = p1["hash"] - p2["hash"]
-            if dist <= max_hamming:
-                pairs.append((p1, p2, dist))
-    return pairs
-
-
-def call_ollama_compare(b64_a: str, b64_b: str, timeout: int = 300, debug: bool = False) -> Dict:
+def call_ollama_compare(b64_a: str, b64_b: str, timeout: int = 300) -> Dict:
+    """调用大模型进行最终裁决"""
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
@@ -86,164 +105,129 @@ def call_ollama_compare(b64_a: str, b64_b: str, timeout: int = 300, debug: bool 
                 "role": "user",
                 "content": (
                     "判断两页中是否包含同一张配图/插图。忽略版面和文本，只看主要图片内容是否相同；"
-                    "若相同 same=true，否则 false。只输出 JSON：{\"same\": true|false, \"confidence\": 0.0-1.0, \"reason\": \"...\"}."
+                    "若相同 same=true，否则 false。必须输出合法 JSON：{\"same\": true, \"confidence\": 0.9, \"reason\": \"原因...\"}."
                 ),
                 "images": [b64_a, b64_b],
             }
         ],
         "stream": False,
+        "options": {"temperature": 0.1}
     }
-    if debug:
-        payload_preview = {
-            "url": OLLAMA_URL,
-            "model": OLLAMA_MODEL,
-            "content_len": len(payload["messages"][0]["content"]),
-            "images_count": len(payload["messages"][0]["images"]),
-            "image_b64_lengths": [len(b64_a), len(b64_b)],
-        }
-        print("[DEBUG] request payload preview:", json.dumps(payload_preview, ensure_ascii=False))
+    
     try:
         r = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+        if r.status_code == 200:
+            res_json = r.json()
+            content = res_json.get("message", {}).get("content", "")
+            # 简单的 JSON 提取逻辑
+            start = content.find('{')
+            end = content.rfind('}') + 1
+            if start != -1 and end != -1:
+                return json.loads(content[start:end])
+            else:
+                logger.warning(f"Ollama 返回了非 JSON 格式: {content[:100]}...")
+    except requests.exceptions.ConnectionError:
+        logger.error("连接 Ollama 失败，请确认 'ollama serve' 是否正在运行。")
+        return {"same": False, "reason": "Connection Error", "confidence": 0.0}
     except Exception as e:
-        return {"error": f"request failed: {e}"}
-    if debug:
-        print("[DEBUG] status:", r.status_code)
-        print("[DEBUG] headers:", {k: v for k, v in r.headers.items()})
-        snippet = r.text[:800]
-        print("[DEBUG] response text snippet:", snippet)
-    if r.status_code != 200:
-        return {"error": f"status {r.status_code}: {r.text}"}
-    # Try to extract JSON from response text
-    text = r.text
-    try:
-        data = r.json()
-    except Exception:
-        data = None
-    if data and isinstance(data, dict):
-        msg = data.get("message", {})
-        text_fields = msg.get("content", "") or json.dumps(data)
-    else:
-        text_fields = text
-    m = re.search(r"(\{\s*\"same\".*\})", text_fields, re.S)
-    if not m:
-        # fallback: find first {...}
-        m2 = re.search(r"(\{.*\})", text_fields, re.S)
-        if not m2:
-            return {"error": "没有在模型返回中找到 JSON"}
-        s = m2.group(1)
-    else:
-        s = m.group(1)
-    try:
-        j = json.loads(s)
-        return {"result": j}
-    except Exception as e:
-        return {"error": f"解析 JSON 失败: {e}", "raw": s}
-
+        logger.error(f"Ollama 调用异常: {e}")
+        
+    return {"same": False, "reason": "Model error", "confidence": 0.0}
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="比较两个 PDF 是否有页面包含相同配图，默认直接让 Ollama 视觉模型判定"
-    )
-    parser.add_argument("pdf1")
-    parser.add_argument("pdf2")
-    parser.add_argument(
-        "--hash-filter",
-        action="store_true",
-        help="先用 phash 过滤候选，再让模型判断（节省模型调用，可能漏检翻转/裁剪）",
-    )
-    parser.add_argument(
-        "--max-hamming",
-        type=int,
-        default=5,
-        help="phash 最大汉明距离，仅在 --hash-filter 时生效，默认 5",
-    )
-    parser.add_argument(
-        "--limit-pairs",
-        type=int,
-        default=None,
-        help="仅对前 N 个候选调用模型，调试用",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="打印请求与响应的调试信息（包含状态码和部分响应文本）",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        default=None,
-        help="输出 CSV 文件路径，未指定时自动生成 results-<timestamp>.csv",
-    )
+    global logger
+    logger, run_ts = setup_logging()
+    
+    parser = argparse.ArgumentParser(description="PDF 配图查重 (Embedding + LLM)")
+    parser.add_argument("pdf1", help="源 PDF 路径")
+    parser.add_argument("pdf2", help="目标 PDF 路径")
+    parser.add_argument("--threshold", type=float, default=0.94, help="向量相似度阈值 (0-1)，默认 0.85")
+    parser.add_argument("-o", "--output", default=None, help="指定输出文件名 (可选)")
     args = parser.parse_args()
 
-    print(f"渲染并提取：{args.pdf1} -> 页面图像")
-    pages1 = render_pdf_pages(args.pdf1, compute_hash=args.hash_filter)
-    print(f"共提取 {len(pages1)} 页")
-    print(f"渲染并提取：{args.pdf2} -> 页面图像")
-    pages2 = render_pdf_pages(args.pdf2, compute_hash=args.hash_filter)
-    print(f"共提取 {len(pages2)} 页")
+    # 0. 准备输出目录
+    if not os.path.exists(BASE_OUTPUT_DIR):
+        os.makedirs(BASE_OUTPUT_DIR)
 
-    pages1 = [p for p in pages1 if p.get("has_image")]
-    pages2 = [p for p in pages2 if p.get("has_image")]
+    # 1. 加载 Embedding 模型
+    logger.info(f"正在加载 Embedding 模型: {EMBEDDING_MODEL_NAME} ...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
+    except Exception as e:
+        logger.error(f"加载 Embedding 模型失败: {e}")
+        sys.exit(1)
 
-    if not pages1:
-        print("源 PDF 无含配图页面，终止")
+    # 2. 提取图片
+    pages1 = render_pdf_pages(args.pdf1)
+    pages2 = render_pdf_pages(args.pdf2)
+    
+    if not pages1 or not pages2:
+        logger.error("未提取到有效页面，程序终止。")
         sys.exit(0)
-    if not pages2:
-        print("目标 PDF 无含配图页面，终止")
-        sys.exit(0)
 
-    if args.hash_filter:
-        candidates = find_candidate_pairs(pages1, pages2, max_hamming=args.max_hamming)
-        if not candidates:
-            print("未发现哈希匹配的页面对")
-            sys.exit(0)
+    # 3. 批量向量化 (Batch Embedding)
+    logger.info(f"正在计算 PDF1 ({len(pages1)} 页) 的向量...")
+    embeddings1 = embed_model.encode([p["image"] for p in pages1], convert_to_tensor=True)
+    
+    logger.info(f"正在计算 PDF2 ({len(pages2)} 页) 的向量...")
+    embeddings2 = embed_model.encode([p["image"] for p in pages2], convert_to_tensor=True)
+
+    # 4. 计算余弦相似度矩阵
+    logger.info("计算向量相似度矩阵...")
+    cosine_scores = util.cos_sim(embeddings1, embeddings2)
+
+    # 5. 筛选候选集
+    candidates = []
+    for i in range(len(pages1)):
+        for j in range(len(pages2)):
+            score = cosine_scores[i][j].item()
+            if score >= args.threshold:
+                candidates.append({
+                    "p1": pages1[i],
+                    "p2": pages2[j],
+                    "score": score
+                })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    logger.info(f"初步筛选: 发现 {len(candidates)} 对潜在相似页面 (阈值 > {args.threshold})")
+
+    # 6. 对候选集进行 LLM 验证
+    # 确定输出文件名
+    if args.output:
+        csv_filename = os.path.join(BASE_OUTPUT_DIR, args.output)
     else:
-        candidates = [(p1, p2, None) for p1 in pages1 for p2 in pages2]
+        csv_filename = os.path.join(BASE_OUTPUT_DIR, f"results_{run_ts}.csv")
+    
+    logger.info(f"结果将写入: {csv_filename}")
 
-    if args.limit_pairs is not None:
-        candidates = candidates[: args.limit_pairs]
-        print(f"仅检测前 {len(candidates)} 个页面配对（limit-pairs 生效）")
-
-    run_ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    output_path = args.output or f"results-{run_ts}.csv"
-
-    results = []
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["timestamp", "page1", "page2", "same", "confidence", "reason"])
-        f.flush()
-        os.fsync(f.fileno())
+        writer.writerow(["page1", "page2", "sim_score", "llm_same", "confidence", "reason"])
 
-        for idx, (p1, p2, dist) in enumerate(candidates, start=1):
-            rec = {
-                "page1": p1["page_index"],
-                "page2": p2["page_index"],
-                "hamming": int(dist) if dist is not None else None,
-            }
-            print(f"[{idx}/{len(candidates)}] 调用 Ollama 判定: 页面 {rec['page1']} vs {rec['page2']}")
-            v = call_ollama_compare(p1["b64"], p2["b64"], debug=args.debug)
-            rec.update(v)
-            results.append(rec)
+        for idx, item in enumerate(candidates, 1):
+            p1 = item["p1"]
+            p2 = item["p2"]
+            logger.info(f"[{idx}/{len(candidates)}] LLM 验证: P{p1['page_index']} <-> P{p2['page_index']} (Embedding分: {item['score']:.4f})")
+            
+            # 调用 Ollama
+            llm_res = call_ollama_compare(p1["b64"], p2["b64"])
+            
+            # 如果 LLM 认为是同一张图，可以打印一条高亮日志
+            if llm_res.get("same"):
+                logger.info(f"    >>> 发现抄袭/相同: 置信度 {llm_res.get('confidence')}")
 
-            res = rec.get("result") or {}
-            writer.writerow(
-                [
-                    run_ts,
-                    rec.get("page1"),
-                    rec.get("page2"),
-                    res.get("same"),
-                    res.get("confidence"),
-                    res.get("reason"),
-                ]
-            )
+            writer.writerow([
+                p1["page_index"],
+                p2["page_index"],
+                f"{item['score']:.4f}",
+                llm_res.get("same"),
+                llm_res.get("confidence"),
+                llm_res.get("reason")
+            ])
             f.flush()
-            os.fsync(f.fileno())
 
-    print("匹配结果:")
-    print(json.dumps(results, ensure_ascii=False, indent=2))
-    print(f"CSV 已写入: {output_path}")
-
+    logger.info("任务完成。")
 
 if __name__ == "__main__":
     main()

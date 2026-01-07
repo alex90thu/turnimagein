@@ -1,4 +1,5 @@
 pymupdf
 Pillow
-imagehash
 requests
+sentence-transformers
+torch
