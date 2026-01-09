@@ -26,7 +26,7 @@ OLLAMA_MODEL = "qwen3-vl:235b"
 
 # [修改] 指向你从 ModelScope 下载的模型文件夹绝对路径
 # 例如: /home/guozehua/models/google_siglip-so400m-patch14-384
-VISION_MODEL_NAME = "/home/guozehua/.cache/modelscope/hub/models/google/siglip-so400m-patch14-384"
+VISION_MODEL_NAME = "/data/guozehua/modelscope/models/google/siglip-so400m-patch14-384"
 
 # 路径设置
 BASE_OUTPUT_DIR = "output"
