@@ -21,3 +21,7 @@ python compare_pdfs.py a.pdf b.pdf
 - 默认会对所有页面配对调用模型，请确保本地 `ollama serve` 已启动且模型可用。
 - 在比较前会跳过不含配图的页面。
 - 输出 CSV 列顺序：timestamp, page1, page2, same, confidence, reason。每个页面配对完成后立刻追加写入，避免中途异常导致数据丢失。默认文件名类似 `results-20260106T130000.csv`，可用 `-o` 自定义。
+
+## 开发状态
+
+**暂缓开发** · 这个工具原本用于检查两份 PDF 是否有重复配图，辅助排查抄袭。目前基本没有使用场景，暂缓继续开发。
